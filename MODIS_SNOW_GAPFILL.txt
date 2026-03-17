@@ -1,0 +1,317 @@
+/********************************************************************
+ * MODIS Snow Cover Product Gap-Filling and Monthly Aggregation
+ * Author: [Decheng Zhou]
+ * Version: 1.0
+ * Date: 2026-03-17
+ * Description: 
+ * This script gap-fills MOD10A1/MYD10A1 snow cover data (MODIS Collection 6.1) 
+ * using cross-sensor fusion and temporal linear interpolation, then aggregates 
+ * daily data to monthly FSC (Fractional Snow Cover) and SCD (Snow Cover Days).
+ * 
+ * Key Steps:
+ * 1. Load and quality-filter MOD10A1/MYD10A1 datasets
+ * 2. Fusion of MOD10A1 (Terra) and MYD10A1 (Aqua) to fill sensor gaps
+ * 3. Temporal linear interpolation for remaining missing values (10-day window)
+ * 4. Aggregate daily data to monthly FSC/SCD and export results
+ * 
+ * Paper Title: Thermal regimes shift dominant controls on Northern Hemisphere urban snow deficits
+ * Citation: For citation details, refer to the published paper.
+ ********************************************************************/
+
+// -------------------------- CONFIGURATION (USER EDITABLE) --------------------------
+// Time range for analysis (YYYY-MM-DD)
+var START_DATE = ee.Date('2021-01-01');
+var END_DATE = ee.Date('2024-09-30');
+
+// Study region (EPSG:4326, [minLon, minLat, maxLon, maxLat])
+// Replace with your actual study region geometry
+var REGION_OF_INTEREST = ee.Geometry.Rectangle([0, 22.5, 180, 90], 'EPSG:4326', false);
+
+// MODIS snow cover correction parameters (calibrated for study region)
+var CORRECTION_PARAMS = {
+  MOD10A1: {a: 1.45, b: -1},  // Formula: FSC = a * NDSI + b
+  MYD10A1: {a: 1.91, b: -64}
+};
+
+// Interpolation window (days) - adjust based on data availability
+var INTERP_WINDOW_DAYS = 10;
+
+// Export parameters
+var EXPORT_SCALE = 500;  // MODIS native resolution (meters)
+var ASSET_FOLDER = 'FSCSCD';  // Cloud Asset folder for exports
+// -----------------------------------------------------------------------------------
+
+// -------------------------- HELPER FUNCTIONS --------------------------
+/**
+ * Load and quality filter MODIS snow cover data
+ * @param {String} collectionId - GEE asset ID of MODIS snow collection
+ * @param {Number} a - Slope for FSC correction
+ * @param {Number} b - Intercept for FSC correction
+ * @returns {ee.ImageCollection} Filtered and corrected snow cover collection
+ */
+var loadAndFilterSnowData = function(collectionId, a, b) {
+  return ee.ImageCollection(collectionId)
+    // Filter spatial/temporal bounds
+    .filterDate(START_DATE, END_DATE)
+    .filterBounds(REGION_OF_INTEREST)
+    // Quality control and FSC correction
+    .map(function(image) {
+      // Extract snow cover and QA bands
+      var snowCover = image.select('NDSI_Snow_Cover');
+      var qaBand = image.select('NDSI_Snow_Cover_Basic_QA');
+      
+      // QA filter: 0-2 = valid data (MODIS QA documentation)
+      var validMask = qaBand.lt(3);
+      
+      // Correct NDSI to FSC (0-100 scale) with boundary constraints
+      var correctedFSC = snowCover.multiply(a).add(b)
+        .round()  // Integer values for FSC
+        .clamp(0, 100)  // Ensure values within valid range (0-100)
+        .toUint8()
+        .rename('FSC');
+      
+      // Apply quality mask and preserve timestamp
+      return correctedFSC.updateMask(validMask)
+        .set({
+          'system:time_start': image.get('system:time_start'),
+          'date': ee.Date(image.get('system:time_start')).format('YYYY-MM-dd')
+        });
+    })
+    // Remove empty images
+    .filter(ee.Filter.listContains('system:band_names', 'FSC'));
+};
+
+/**
+ * Fuse MOD10A1 and MYD10A1 to fill sensor gaps
+ * @param {ee.ImageCollection} modCol - MOD10A1 collection
+ * @param {ee.ImageCollection} mydCol - MYD10A1 collection
+ * @returns {ee.ImageCollection} Fused snow cover collection
+ */
+var fuseModisCollections = function(modCol, mydCol) {
+  // MYD10A1 starts from 2002-07-14 (Aqua launch date)
+  var MYD_START_DATE = ee.Date('2002-07-14');
+  
+  return modCol.map(function(modImage) {
+    var imageDate = ee.Date(modImage.get('system:time_start'));
+    
+    // Use MOD10A1 only for dates before MYD10A1 availability
+    if (imageDate.lt(MYD_START_DATE)) {
+      return modImage;
+    }
+    
+    // Find matching MYD10A1 image for the same date
+    var mydImage = ee.Image(mydCol.filterDate(imageDate, imageDate.advance(1, 'day')).first());
+    
+    // Fill MOD10A1 gaps with MYD10A1 (only if MYD image exists)
+    return ee.Algorithms.If(
+      mydImage.bandNames().size().gt(0),
+      modImage.unmask(mydImage),  // Fill gaps with MYD10A1
+      modImage  // Fallback to MOD10A1 if no MYD data
+    );
+  });
+};
+
+/**
+ * Add timestamp band for temporal interpolation
+ * @param {ee.Image} image - Input image with FSC band
+ * @returns {ee.Image} Image with added timestamp band
+ */
+var addTimestampBand = function(image) {
+  var timestamp = ee.Image.constant(image.get('system:time_start'))
+    .rename('timestamp')
+    .updateMask(image.mask())
+    .toFloat();
+  return image.addBands(timestamp);
+};
+
+/**
+ * Linear temporal interpolation for gap-filling
+ * @param {ee.ImageCollection} col - Image collection with timestamp band
+ * @param {Number} windowDays - Interpolation window (days)
+ * @returns {ee.ImageCollection} Gap-filled collection
+ */
+var temporalInterpolation = function(col, windowDays) {
+  // Convert days to milliseconds for time filter
+  var windowMillis = ee.Number(windowDays).multiply(86400000);
+  
+  // 1. Join collection with itself to find images after target (within window)
+  var afterFilter = ee.Filter.and(
+    ee.Filter.maxDifference({
+      difference: windowMillis,
+      leftField: 'system:time_start',
+      rightField: 'system:time_start'
+    }),
+    ee.Filter.lessThanOrEquals({
+      leftField: 'system:time_start',
+      rightField: 'system:time_start'
+    })
+  );
+  
+  var afterJoin = ee.Join.saveAll({
+    matchesKey: 'after',
+    ordering: 'system:time_start',
+    ascending: false
+  });
+  
+  var withAfter = afterJoin.apply(col, col, afterFilter);
+  
+  // 2. Join to find images before target (within window)
+  var beforeFilter = ee.Filter.and(
+    ee.Filter.maxDifference({
+      difference: windowMillis,
+      leftField: 'system:time_start',
+      rightField: 'system:time_start'
+    }),
+    ee.Filter.greaterThanOrEquals({
+      leftField: 'system:time_start',
+      rightField: 'system:time_start'
+    })
+  );
+  
+  var beforeJoin = ee.Join.saveAll({
+    matchesKey: 'before',
+    ordering: 'system:time_start',
+    ascending: true
+  });
+  
+  var withBeforeAfter = beforeJoin.apply(withAfter, withAfter, beforeFilter);
+  
+  // 3. Apply linear interpolation
+  var interpolate = function(image) {
+    image = ee.Image(image);
+    var beforeImages = ee.List(image.get('before'));
+    var afterImages = ee.List(image.get('after'));
+    
+    // Mosaic to get closest valid pixels from before/after
+    var beforeMosaic = ee.ImageCollection.fromImages(beforeImages).mosaic();
+    var afterMosaic = ee.ImageCollection.fromImages(afterImages).mosaic();
+    
+    // Interpolation formula: y = y1 + (y2-y1)*((t-t1)/(t2-t1))
+    var t1 = beforeMosaic.select('timestamp');
+    var t2 = afterMosaic.select('timestamp');
+    var t = ee.Image.constant(image.get('system:time_start')).rename('timestamp');
+    
+    var timeRatio = t.subtract(t1).divide(t2.subtract(t1)).clamp(0, 1);  // Constrain ratio to 0-1
+    var interpolatedFSC = beforeMosaic.select('FSC')
+      .add(afterMosaic.select('FSC').subtract(beforeMosaic.select('FSC')).multiply(timeRatio))
+      .round()
+      .toUint8()
+      .rename('FSC');
+    
+    // Replace masked pixels with interpolated values
+    return image.select('FSC').unmask(interpolatedFSC)
+      .set(image.toDictionary(image.propertyNames()));
+  };
+  
+  return ee.ImageCollection(withBeforeAfter.map(interpolate));
+};
+
+/**
+ * Aggregate daily FSC to monthly FSC (mean) and SCD (snow cover days)
+ * @param {ee.ImageCollection} dailyCol - Gap-filled daily FSC collection
+ * @returns {ee.ImageCollection} Monthly FSC/SCD collection
+ */
+var aggregateToMonthly = function(dailyCol) {
+  var years = ee.List.sequence(START_DATE.get('year'), END_DATE.get('year'));
+  var monthlyCollections = ee.List([]);
+  
+  // Iterate over years
+  years.evaluate(function(yearList) {
+    yearList.forEach(function(year) {
+      // Define valid months for each year
+      var months;
+      if (year === START_DATE.get('year')) {
+        months = ee.List.sequence(START_DATE.get('month'), 12);
+      } else if (year === END_DATE.get('year')) {
+        months = ee.List.sequence(1, END_DATE.get('month'));
+      } else {
+        months = ee.List.sequence(1, 12);
+      }
+      
+      // Iterate over months
+      months.evaluate(function(monthList) {
+        monthList.forEach(function(month) {
+          // Define monthly time range
+          var monthStart = ee.Date.fromYMD(year, month, 1);
+          var monthEnd = monthStart.advance(1, 'month').advance(-1, 'day');
+          
+          // Filter daily data for the month
+          var monthlyDaily = dailyCol.filterDate(monthStart, monthEnd);
+          
+          // Calculate monthly mean FSC
+          var monthlyFSC = monthlyDaily.mean()
+            .rename('monthly_FSC')
+            .toUint8();
+          
+          // Calculate SCD (days with FSC > 50%)
+          var monthlySCD = monthlyDaily.map(function(img) {
+              return img.gt(50).rename('SCD').toUint8();
+            })
+            .sum()
+            .rename('monthly_SCD')
+            .toUint8();
+          
+          // Combine FSC and SCD
+          var monthlyImage = ee.Image.cat([monthlyFSC, monthlySCD])
+            .set({
+              'year': year,
+              'month': month,
+              'system:time_start': monthStart.millis(),
+              'date': monthStart.format('YYYY-MM')
+            });
+          
+          // Export to Cloud Asset
+          var exportName = 'FSC_SCD_' + year + '_' + (month < 10 ? '0' + month : month);
+          Export.image.toAsset({
+            image: monthlyImage,
+            description: exportName,
+            assetId: ASSET_FOLDER + '/' + exportName,
+            region: REGION_OF_INTEREST,
+            scale: EXPORT_SCALE,
+            maxPixels: 1e11,
+            crs: 'EPSG:4326'
+          });
+          
+          monthlyCollections = monthlyCollections.add(monthlyImage);
+        });
+      });
+    });
+  });
+  
+  return ee.ImageCollection.fromImages(monthlyCollections);
+};
+
+// -------------------------- MAIN WORKFLOW --------------------------
+print('Step 1: Loading and filtering MODIS snow cover data');
+var mod10a1 = loadAndFilterSnowData('MODIS/061/MOD10A1', CORRECTION_PARAMS.MOD10A1.a, CORRECTION_PARAMS.MOD10A1.b);
+var myd10a1 = loadAndFilterSnowData('MODIS/061/MYD10A1', CORRECTION_PARAMS.MYD10A1.a, CORRECTION_PARAMS.MYD10A1.b);
+
+print('Step 2: Fusing MOD10A1 and MYD10A1 to fill sensor gaps');
+var fusedCollection = fuseModisCollections(mod10a1, myd10a1);
+
+print('Step 3: Applying temporal interpolation (10-day window)');
+var collectionWithTimestamp = fusedCollection.map(addTimestampBand);
+var gapFilledCollection = temporalInterpolation(collectionWithTimestamp, INTERP_WINDOW_DAYS);
+
+print('Step 4: Aggregating to monthly FSC and SCD');
+var monthlyCollection = aggregateToMonthly(gapFilledCollection);
+
+// -------------------------- VISUALIZATION (OPTIONAL) --------------------------
+// Center map on study region
+Map.centerObject(REGION_OF_INTEREST, 3);
+
+// Add monthly mean FSC/SCD to map (2021 average as example)
+var exampleYear = monthlyCollection.filter(ee.Filter.eq('year', 2021)).mean();
+Map.addLayer(exampleYear.select('monthly_FSC'), {
+  min: 0, max: 100, 
+  palette: ['#ffffff', '#cceeff', '#99bbff', '#0066ff']
+}, '2021 Mean Monthly FSC');
+
+Map.addLayer(exampleYear.select('monthly_SCD'), {
+  min: 0, max: 31, 
+  palette: ['#ffffff', '#ccf5ff', '#99e6ff', '#0099ff']
+}, '2021 Mean Monthly SCD');
+
+// -------------------------- OUTPUT SUMMARY --------------------------
+print('Final Monthly FSC/SCD Collection:', monthlyCollection);
+print('Number of monthly images:', monthlyCollection.size());
